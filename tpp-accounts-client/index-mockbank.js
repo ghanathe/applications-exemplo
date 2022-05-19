@@ -9,8 +9,9 @@ const USE_DYNAMIC_SCOPE = true;
 (async () => {
     const { Issuer, custom, generators /*, TokenSet */ } = require('openid-client');
     const fs = require('fs');
-    const { default: fromKeyLike } = require('jose/jwk/from_key_like');
+    // const jose = require('jose');
     const crypto = require('crypto');
+    const pki = require('node-forge').pki;
     const express = require('express');
     const cookieParser = require('cookie-parser');
     const app = express();
@@ -18,16 +19,19 @@ const USE_DYNAMIC_SCOPE = true;
     const https = require('https');
     const { default: axios } = require('axios');
     const jp = require('jsonpath');
-
+    const { default: fromKeyLike } = require('jose/jwk/from_key_like');
 
 
     const certsPath = path.join(__dirname, './certs/');
 
     const key = crypto.createPrivateKey(fs.readFileSync(certsPath + 'signing.key'));
-
-
     const privateJwk = await fromKeyLike(key);
+    // const privateJwk = await jose.exportJWK(key);
     privateJwk.kid = '8o-O3VSFOPE8TrULXUTHxhxJcdADKIBmsfE0KWYkHik';
+
+    // const ks = fs.readFileSync(certsPath + "signing.jwk");
+    // var privateJwk = await jose.createLocalJWKSet(JSON.parse(ks.toString()));
+
     console.log('Create private jwk key %O', privateJwk);
 
     const keyset = {
@@ -45,23 +49,100 @@ const USE_DYNAMIC_SCOPE = true;
 
     const instance = axios.create({ httpsAgent });
 
+    const directoryResponse = await instance.get('https://auth.sandbox.directory.openbankingbrasil.org.br/.well-known/openid-configuration');
+
+    const directoryConfiguration = directoryResponse.data;
+    // console.log(directoryConfiguration);
+
+    const params = new URLSearchParams()
+    params.append('grant_type', 'client_credentials')
+    params.append('scope', 'directory:software')
+    params.append('client_id', 'QjRzruzFWi_U_tMahlz01')
+
+    const directoryToken = await instance.post(directoryConfiguration.mtls_endpoint_aliases.token_endpoint, params, {
+        headers: {
+            'Content-Type': 'application/x-www-form-urlencoded'
+        }
+    });
+    // console.log(`Bearer ${directoryToken.data.access_token}`);
+    // 74e929d9-33b6-4d85-8ba7-c146c867a817
+    // 10120340-3318-4baf-99e2-0b56729c4ab2
+    const softwareAssertion = await instance.get('https://matls-api.sandbox.directory.openbankingbrasil.org.br/organisations/74e929d9-33b6-4d85-8ba7-c146c867a817/softwarestatements/10120340-3318-4baf-99e2-0b56729c4ab2/assertion',
+        {
+            headers: {
+                "Accept": "application/jwt;charset=UTF-8",
+                'Authorization': `Bearer ${directoryToken.data.access_token}`
+            }
+        });
+    // console.log('Software Assertion ' + softwareAssertion.data);
+
+    const ca = softwareAssertion.data;
+    const base64Url = ca.split('.')[1];
+    const decodedValue = JSON.parse(Buffer.from(base64Url, 'base64'));
+    console.log('Software Assertion JWKS URL ' + decodedValue.software_jwks_uri);
+
+    const certBuf = fs.readFileSync(certsPath + 'transport.pem');
+
+
+    const cert = pki.certificateFromPem(certBuf.toString());
+    const subject = cert.subject.attributes
+        .map(attr => [attr.shortName, attr.value].join('='))
+        .join(', ');
+
+    console.log(subject); // "C=US, ST=Cal
+
+    const dcrRequest = {
+        grant_types: [
+            "authorization_code",
+            "implicit",
+            "refresh_token",
+            "client_credentials"
+        ],
+        tls_client_auth_subject_dn: subject,
+        jwks_uri: decodedValue.software_jwks_uri,
+        token_endpoint_auth_method: "tls_client_auth",
+        response_types: [
+            "code id_token"
+        ],
+        redirect_uris: [
+            "https://localhost.emobix.co.uk:8443/test/a/obbsb/callback"
+        ],
+        software_statement: softwareAssertion.data
+    };
+
+    const dcrRegistration = await instance.post('https://matls-auth.mockbank.poc.raidiam.io/reg', dcrRequest, {
+        headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'Accept-Charset': 'utf-8',
+        }
+    });
+    console.log(`DCR ClientID ${dcrRegistration.data.client_id}`);
+    console.log(`DCR registration_client_uri ${dcrRegistration.data.registration_client_uri}`);
+    console.log(`DCR registration_access_token ${dcrRegistration.data.registration_access_token}`);
+    console.log(JSON.stringify(dcrRegistration.data));
+
+
+
+
+
     const axiosResponse = await instance.get('https://data.sandbox.directory.openbankingbrasil.org.br/participants');
-    
     const availableBanks = axiosResponse.data;
+    // console.log(JSON.stringify(availableBanks));
     let authServer;
     const foundBank = availableBanks.find(server => {
         if (server.AuthorisationServers && server.AuthorisationServers.some(as => {
             if (as.CustomerFriendlyName == 'Mock Bank') {
                 authServer = as;
                 return true;
-        }  }))
-        {
+            }
+        })) {
             return server;
         }
     });
 
-    console.log(foundBank);
-    console.log(authServer);
+    // console.log(foundBank);
+    // console.log(authServer);
 
     // @ts-ignore
     let consentEndPointCollection;
@@ -69,13 +150,13 @@ const USE_DYNAMIC_SCOPE = true;
         if (ep.ApiFamilyType == 'consents') {
             consentEndPointCollection = ep;
             return true;
-    } }))
-    {
+        }
+    })) {
         console.log('This authorisation server is not advertising a consents api collection');
         throw new exception('Authorisation Server does not support consents api family');
     }
 
-    console.log(consentEndPointCollection);
+    // console.log(consentEndPointCollection);
     //Get the correct consent endpoint and then use that to instantiate the API.
     let consentApiEndpoint;
     if (!consentEndPointCollection || !consentEndPointCollection.ApiDiscoveryEndpoints || !consentEndPointCollection.ApiDiscoveryEndpoints.some(ep => {
@@ -83,19 +164,18 @@ const USE_DYNAMIC_SCOPE = true;
             consentApiEndpoint = ep;
             return true;
         }
-    }))
-    {
+    })) {
         console.log('This authorisation server is not advertising a consents api collection');
         throw new exception('Authorisation Server does not the correct consent API');
     }
-    
+
 
     const consentsApi = new ConsentsApi(
         undefined,
         consentApiEndpoint.ApiEndpoint.split('/consents/v1/consents')[0],
         instance
     );
-    
+
     //Load the Accounts API
 
     let accountsEndPointCollection;
@@ -103,13 +183,13 @@ const USE_DYNAMIC_SCOPE = true;
         if (ep.ApiFamilyType == 'accounts') {
             accountsEndPointCollection = ep;
             return true;
-    } }))
-    {
+        }
+    })) {
         console.log('This authorisation server is not advertising an accounts api collection');
         throw new exception('Authorisation Server does not support accounts api family');
     }
 
-    console.log(accountsEndPointCollection);
+    // console.log(accountsEndPointCollection);
     //Get the correct consent endpoint and then use that to instantiate the API.
     let accountsApiEndpoint;
     if (!accountsEndPointCollection || !accountsEndPointCollection.ApiDiscoveryEndpoints || !accountsEndPointCollection.ApiDiscoveryEndpoints.some(ep => {
@@ -117,8 +197,7 @@ const USE_DYNAMIC_SCOPE = true;
             accountsApiEndpoint = ep;
             return true;
         }
-    }))
-    {
+    })) {
         console.log('This authorisation server is not advertising an accounts api collection');
         throw new exception('Authorisation Server does not advertise the correct accounts API');
     }
@@ -147,7 +226,7 @@ const USE_DYNAMIC_SCOPE = true;
                 given_name: {
                     essential: true,
                 },
-                
+
                 acr: {
                     value: 'urn:brasil:openbanking:loa2',
                     essential: true
@@ -160,7 +239,7 @@ const USE_DYNAMIC_SCOPE = true;
                 given_name: {
                     essential: true,
                 },
-               
+
                 acr: {
                     value: 'urn:brasil:openbanking:loa2',
                     essential: true
@@ -169,10 +248,10 @@ const USE_DYNAMIC_SCOPE = true;
         };
 
         const scope = USE_DYNAMIC_SCOPE ? `openid consent:${consentId} accounts` : 'openid';
-        const requestObject = await fapiClient.requestObject({
+        const obj = {
             scope,
             response_type: 'code id_token',
-            redirect_uri: 'https://tpp.localhost/cb',
+            redirect_uri: 'https://localhost.emobix.co.uk:8443/test/a/obbsb/callback',
             code_challenge,
             code_challenge_method: 'S256',
             response_mode: 'form_post',
@@ -180,59 +259,59 @@ const USE_DYNAMIC_SCOPE = true;
             nonce,
             claims,
             max_age: 900
-        });
+        };
+        console.log(JSON.stringify(obj));
+        const requestObject = await fapiClient.requestObject(obj);
 
-        //console.log('Request Object %o', requestObject)
+        console.log('Request Object ' + requestObject);
 
 
-      let reference;
-      let authUrl;
+        let reference;
+        let authUrl;
 
-      if (usePar) {
+        if (usePar) {
 
-        try {
-          reference = await fapiClient.pushedAuthorizationRequest({
-          /*   request_uri: 'https://pingfederate-engine.obb-bank.raidiam.io/as/par.oauth2', // OVERRIDE !! */
-            request: requestObject
+            try {
+                reference = await fapiClient.pushedAuthorizationRequest({
+                    request: requestObject
+                });
+            } catch (e) {
+                console.log(e);
+            }
 
-          });
-        } catch (e) {
-          console.log(e);
+            authUrl = await fapiClient.authorizationUrl({ request_uri: reference.request_uri });
+            console.log(authUrl);
+
+        } else {
+            authUrl = await fapiClient.authorizationUrl({ request: requestObject });
         }
-
-        authUrl   = await fapiClient.authorizationUrl({ request_uri: reference.request_uri });
         console.log(authUrl);
-
-      } else {
-        authUrl = await fapiClient.authorizationUrl({ request: requestObject });
-      }
-        console.log(authUrl);
-        return { authUrl, code_verifier, state, nonce };
+        return { authUrl: authUrl + '&scope=' + encodeURIComponent(obj.scope) + '&response_type=' + encodeURIComponent(obj.response_type), code_verifier, state, nonce };
     }
 
     custom.setHttpOptionsDefaults({
         hooks: {
             beforeRequest: [
-            (options) => {
-                console.log('--> %s %s', options.method.toUpperCase(), options.url.href);
-                console.log('--> HEADERS %o', options.headers);
-                if (options.body) {
-                console.log('--> BODY %s', options.body);
-                }
-                if (options.form) {
-                console.log('--> FORM %s', options.form);
-                }
-            },
+                (options) => {
+                    console.log('--> REQUEST %s %s', options.method.toUpperCase(), options.url.href);
+                    console.log('--> REQUEST HEADERS %o', options.headers);
+                    if (options.body) {
+                        console.log('--> REQUEST BODY %s', options.body);
+                    }
+                    if (options.form) {
+                        console.log('--> REQUEST FORM %s', options.form);
+                    }
+                },
             ],
             afterResponse: [
-            (response) => {
-                console.log('<-- %i FROM %s %s', response.statusCode, response.request.options.method.toUpperCase(), response.request.options.url.href);
-                console.log('<-- HEADERS %o', response.headers);
-                if (response.body) {
-                console.log('<-- BODY %s', response.body);
-                }
-                return response;
-            },
+                (response) => {
+                    console.log('<-- RESPONSE %i FROM %s %s', response.statusCode, response.request.options.method.toUpperCase(), response.request.options.url.href);
+                    console.log('<-- RESPONSE HEADERS %o', response.headers);
+                    if (response.body) {
+                        console.log('<-- RESPONSE BODY %s', JSON.stringify(response.body));
+                    }
+                    return response;
+                },
             ],
         },
         timeout: 5000,
@@ -244,26 +323,26 @@ const USE_DYNAMIC_SCOPE = true;
         }
     });
 
-   const localIssuer = await Issuer.discover('https://auth.mockbank.poc.raidiam.io/');
+    const localIssuer = await Issuer.discover('https://auth.mockbank.poc.raidiam.io/');
 
     console.log('Discovered issuer %s %O', localIssuer.issuer, localIssuer.metadata);
+
     const { FAPIClient } = localIssuer;
 
     const fapiClient = await FAPIClient.fromUri(
-      'https://matls-auth.mockbank.poc.raidiam.io/reg/-NJXWEC8TOPVSBSg8Uh0L',
-      'plxDjDVbB6r_flb7ZJDbu6tj6Mx6Bci52dLIYuryp26',
-      keyset
+        dcrRegistration.data.registration_client_uri,
+        dcrRegistration.data.registration_access_token,
+        keyset
     );
 
     console.log('Discovered client %O', fapiClient);
 
     fapiClient[custom.http_options] = function (options) {
-        // see https://github.com/sindresorhus/got/tree/v11.8.0#advanced-https-api
         options.https = {};
         options.https.rejectUnauthorized = false;
 
-        options.https.certificate          = fs.readFileSync(certsPath + 'transport.pem'); // <string> | <string[]> | <Buffer> | <Buffer[]>
-        options.https.key                  = fs.readFileSync(certsPath + 'transport.key');
+        options.https.certificate = fs.readFileSync(certsPath + 'transport.pem'); // <string> | <string[]> | <Buffer> | <Buffer[]>
+        options.https.key = fs.readFileSync(certsPath + 'transport.key');
         options.https.certificateAuthority = fs.readFileSync(certsPath + 'ca.pem');// <string> | <string[]> | <Buffer> | <Buffer[]> | <Object[]>
         return options;
     };
@@ -282,9 +361,9 @@ const USE_DYNAMIC_SCOPE = true;
         res.sendFile(path.join(__dirname, './views', 'index.html'));
     });
 
-    app.use(express.urlencoded());
+    app.use(express.urlencoded({ extended: true }))
 
-    app.post('/cb', async (req, res) => {
+    app.post('/test/a/obbsb/callback', async (req, res) => {
 
         const callbackParams = fapiClient.callbackParams(req);
 
@@ -292,17 +371,17 @@ const USE_DYNAMIC_SCOPE = true;
 
         if (!Object.keys(callbackParams).length) {
 
-            
+
             console.log('Creating Consent');
 
-            const tokens = await fapiClient.grant({ scope: 'openid consents consent resources user:account user:consent', grant_type: 'client_credentials' });
+            const tokens = await fapiClient.grant({ scope: 'openid consents resources', grant_type: 'client_credentials' });
             console.log(tokens.access_token);
 
             const introspection = await fapiClient.introspect(tokens.access_token);
             console.log(introspection);
 
             const oneYearFromNow = new Date();
-            oneYearFromNow.setMonth(oneYearFromNow.getMonth() + 9);
+            oneYearFromNow.setMonth(oneYearFromNow.getMonth() + 2);
             var oneYearAndOneDayFromNow = new Date();
 
             oneYearAndOneDayFromNow.setFullYear(oneYearAndOneDayFromNow.getFullYear() + 1);
@@ -312,19 +391,23 @@ const USE_DYNAMIC_SCOPE = true;
             const createPost = await consentsApi.consentsPostConsents(`${tokens.token_type} ${tokens.access_token}`,
                 {
                     data: {
-                        permissions: [CreateConsentDataPermissionsEnum.AccountsRead, CreateConsentDataPermissionsEnum.AccountsBalancesRead, CreateConsentDataPermissionsEnum.AccountsTransactionsRead, CreateConsentDataPermissionsEnum.ResourcesRead ],
+                        permissions: [CreateConsentDataPermissionsEnum.AccountsRead, CreateConsentDataPermissionsEnum.AccountsBalancesRead, CreateConsentDataPermissionsEnum.AccountsTransactionsRead, CreateConsentDataPermissionsEnum.ResourcesRead],
                         expirationDateTime: oneYearFromNow.toISOString(),
                         loggedUser: {
                             document: {
                                 identification: '76109277673',
                                 rel: 'CPF'
-                           } 
+                            }
                         },
                     }
                 }).catch(err => {
                     console.log(err);
                 });
-            console.log(createPost);
+            console.log(JSON.stringify(createPost.data));
+
+            const consent = await consentsApi.consentsGetConsentsConsentId(createPost.data.data.consentId, `${tokens.token_type} ${tokens.access_token}`);
+            console.log('Consent ' + JSON.stringify(consent.data));
+
             const { authUrl, code_verifier, state, nonce } = await generateRequest(createPost.data.data.consentId, USE_PAR);
 
             res.cookie('bank.state', state, { path, sameSite: 'none', secure: true });
@@ -359,10 +442,10 @@ const USE_DYNAMIC_SCOPE = true;
             const code_verifier = req.cookies['bank.code_verifier'];
             res.cookie('bank.code_verifier', null, { path });
 
-             tokenSet = await fapiClient.callback('https://tpp.localhost/cb',
-               callbackParams,
-               { code_verifier, state, nonce, response_type: 'code id_token' },
-               { clientAssertionPayload: { aud: localIssuer.mtls_endpoint_aliases.token_endpoint } });
+            tokenSet = await fapiClient.callback('https://localhost.emobix.co.uk:8443/test/a/obbsb/callback',
+                callbackParams,
+                { code_verifier, state, nonce, response_type: 'code id_token' },
+                { clientAssertionPayload: { aud: localIssuer.mtls_endpoint_aliases.token_endpoint } });
 
             console.log(tokenSet);
 
@@ -371,7 +454,7 @@ const USE_DYNAMIC_SCOPE = true;
             accounts = await (await accountsApi.getAccounts(`${tokenSet.token_type} ${tokenSet.access_token}`)).data;
             account = await (await accountsApi.getAccountsAccountId(`${tokenSet.token_type} ${tokenSet.access_token}`, accounts.data[0].accountId)).data;
             balance = await (await accountsApi.getAccountsAccountIdBalances(`${tokenSet.token_type} ${tokenSet.access_token}`, accounts.data[0].accountId)).data;
-            transactions = await (await accountsApi.getAccountsAccountIdTransactions(`${tokenSet.token_type} ${tokenSet.access_token}`, accounts.data[0].accountId)).data;
+            // transactions = await (await accountsApi.getAccountsAccountIdTransactions(`${tokenSet.token_type} ${tokenSet.access_token}`, accounts.data[0].accountId)).data;
             //overdraftLimit = await (await accountsApi.getAccountsAccountIdOverdraftLimits(`${tokenSet.token_type} ${tokenSet.access_token}`, accounts.data[0].accountId)).data;
 
         }
@@ -382,23 +465,23 @@ const USE_DYNAMIC_SCOPE = true;
 
         //Make a client credentials grant
 
-        return res.json({ status: 'Received', introspection: introspection, id_token_claims: tokenSet.claims(), accounts, account, balance, transactions});
+        return res.json({ status: 'Received', introspection: introspection, id_token_claims: tokenSet.claims(), accounts, account, balance, transactions });
     });
 
 
-    
-    https
-    .createServer(
-        {
-        // ...
-        key: fs.readFileSync(certsPath + 'transport.key'),
-            cert: fs.readFileSync(certsPath + 'transport.pem'),
-        // ...
-        },
-        app
-    )
-    .listen(443);
 
-    console.log('Node.js web server at port 443 is running..');
+    https
+        .createServer(
+            {
+                // ...
+                key: fs.readFileSync(certsPath + 'transport.key'),
+                cert: fs.readFileSync(certsPath + 'transport.pem'),
+                // ...
+            },
+            app
+        )
+        .listen(8443);
+
+    console.log('Node.js web server at port 8443 is running..');
 
 })();
